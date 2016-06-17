@@ -25,6 +25,25 @@ The forwarding code is based on l2_multi.
 
 Depends on openflow.discovery
 Works with openflow.spanning_tree (sort of)
+
+
+--- logical_routing Component ---
+This component aim to routing:
+    - based on hosts IPs (no MAC taken into account
+    - based on predetrmined logical routing between pairs of hosts (basically should be output of some
+        algorithm on the phyical graph (e.g MM_SRLG)
+    - can recover from 1 fail at most: the recovery process search for alternative path, also based
+        on the predetrmined logical paths in the network.
+
+Path Choosing Algorithm:
+    - preaction process: init flow tables based on given logical paths
+    - on failure: for each pair of host which harmed by the failure - randomly select
+        alternative path and config flow tables on the path (old ones dont care)
+    - on link up: actually nothing to do. the only thing is that we need to keep the initial
+        set of the logical paths, so after another failure - we could switch to alternative path
+        over the link the went up.
+    - in each case, anyway, we care about the pairs that harmed by the failure, and we reset all the flow entries
+        in all the appropriate switches (that are on the new path) that corresponding to the host pair.
 """
 
 from pox.core import core
@@ -40,6 +59,10 @@ from collections import defaultdict
 from pox.openflow.discovery import Discovery
 import time
 
+import imp
+
+OptNet = imp.load_source('OpticalNetwork', 'optical_network/src/main/OpticalNetwork.py')
+
 log = core.getLogger("f.t_p")
 
 
@@ -52,6 +75,34 @@ switches_by_id = {}
 
 # [sw1][sw2] -> (distance, intermediate)
 path_map = defaultdict(lambda:defaultdict(lambda:(None,None)))
+
+# switchid -> (ip_pair -> next_hop)
+switchid_to_flowing = {}
+
+def set_all_flow_tables():
+    log.debug('set_all_flow_tables: dpids=%s. ids=%s. adjaceny.keys=%s. adjacency.values=%s' % (switches_by_dpid.keys(), switchid_to_flowing.keys(), adjacency.keys(), adjacency.values())  )
+    sw_dpids = switches_by_dpid.keys()
+    for sw_dpid in sw_dpids:
+        sw_id = int(sw_dpid)
+        for (ip_src, ip_dst) in switchid_to_flowing[sw_id].keys():
+            msg = of.ofp_flow_mod()
+            msg.match = of.ofp_match()
+            msg.match.dl_type = pkt.ethernet.IP_TYPE
+            msg.match.nw_dst = ip_dst
+            msg.match.nw_src = ip_src
+            msg.priority = 65535
+            hop_out_id = switchid_to_flowing[sw_id][(ip_src, ip_dst)]
+            log.debug('sw=%s. hop_out_id=%s.' % (sw_id, hop_out_id))
+            if hop_out_id != sw_id:
+                port_num = adjacency[switches_by_dpid[sw_dpid]][switches_by_dpid[hop_out_id]]
+                #log.debug('adjacency=%s. type=%s' % (port_num, type(port_num)))
+                #port_num = port_out.port_no
+            else:
+                port_num = 1 #TODO: find hosts port num
+            log.debug("send_table: set rule for nw_dst=%s." % msg.match.nw_dst)
+            msg.actions.append(of.ofp_action_output(port=port_num))
+            sw = switches_by_dpid[sw_dpid]
+            sw.connection.send(msg)
 
 
 def dpid_to_mac (dpid):
@@ -119,6 +170,7 @@ def _get_path (src, dst):
   """
   Gets a cooked path -- a list of (node,out_port)
   """
+  #log.debug("get_path: src=%s. dst=%s.", str(src), str(dst))
   # Start with a raw path...
   if src == dst:
     path = [src]
@@ -145,6 +197,7 @@ def ipinfo (ip):
   return switches_by_id.get(ID),port,num
 
 
+# this object created for every switch
 class TopoSwitch (DHCPD):
   _eventMixin_events = set([DHCPLease])
   _next_id = 100
@@ -158,6 +211,7 @@ class TopoSwitch (DHCPD):
 
   def __init__ (self):
     self.log = log.getChild("Unknown")
+    self.log.debug("TopoSwitch __init__:")
 
     self.connection = None
     self.ports = None
@@ -176,6 +230,8 @@ class TopoSwitch (DHCPD):
     self.addListenerByName("DHCPLease", self._on_lease)
 
     core.ARPHelper.addListeners(self)
+    self.ip_pair_to_port = {}
+
 
 
   def _handle_ARPRequest (self, event):
@@ -184,15 +240,17 @@ class TopoSwitch (DHCPD):
 
 
   def send_table (self):
+    #self.log.debug("send_table:")
     if self.connection is None:
       self.log.debug("Can't send table: disconnected")
       return
 
+    # clearing all rules:
     clear = of.ofp_flow_mod(command=of.OFPFC_DELETE)
     self.connection.send(clear)
     self.connection.send(of.ofp_barrier_request())
 
-    # From DHCPD
+    # Setting rules for packets coming DHCP deamon:
     msg = of.ofp_flow_mod()
     msg.match = of.ofp_match()
     msg.match.dl_type = pkt.ethernet.IP_TYPE
@@ -206,6 +264,12 @@ class TopoSwitch (DHCPD):
 
     core.openflow_discovery.install_flow(self.connection)
 
+
+
+    '''
+    # Setting rules for packet with dst IP of other networks (10.<swid>.0.0) to
+    # next HOP by shortest path algo. used to route between switches.
+    # we dont need it since we send traffic host-to-host
     src = self
     for dst in switches_by_dpid.itervalues():
       if dst is src: continue
@@ -217,9 +281,11 @@ class TopoSwitch (DHCPD):
       msg.match.dl_type = pkt.ethernet.IP_TYPE
       #msg.match.nw_dst = "%s/%s" % (dst.network, dst.subnet)
       msg.match.nw_dst = "%s/%s" % (dst.network, "255.255.0.0")
-
+      self.log.debug("send_table: set rule for nw_dst=%s." % msg.match.nw_dst)
       msg.actions.append(of.ofp_action_output(port=p[0][1]))
+      log.debug("bp1 - msg.match.nw_dst=%s." % msg.match.nw_dst)
       self.connection.send(msg)
+    '''
 
     """
     # Can just do this instead of MAC learning if you run arp_responder...
@@ -234,9 +300,12 @@ class TopoSwitch (DHCPD):
       self.connection.send(msg)
     """
 
+    # adjust dst MAC to dst IP. happend after DHCP lease
     for ip,mac in self.ip_to_mac.iteritems():
+      log.debug("bp3 - ip=%s." % ip)
       self._send_rewrite_rule(ip, mac)
 
+    # Setting rules for host inside the switch's network (connected directly)
     flood_ports = []
     for port in self.ports:
       p = port.port_no
@@ -253,6 +322,8 @@ class TopoSwitch (DHCPD):
       msg.actions.append(of.ofp_action_output(port=of.OFPP_CONTROLLER))
       self.connection.send(msg)
 
+
+    # Setting rules for Broadcasting:
     msg = of.ofp_flow_mod()
     msg.priority -= 1
     msg.match = of.ofp_match()
@@ -273,6 +344,7 @@ class TopoSwitch (DHCPD):
     msg.actions.append(of.ofp_action_dl_addr.set_src(self.mac))
     msg.actions.append(of.ofp_action_dl_addr.set_dst(mac))
     msg.actions.append(of.ofp_action_output(port=p))
+    log.debug("bp2 - msg.match.nw_dst=%s." % msg.match.nw_dst)
     self.connection.send(msg)
 
 
@@ -285,6 +357,7 @@ class TopoSwitch (DHCPD):
 
 
   def connect (self, connection):
+    log.debug("TopoSwitch - connect: type(connection)=%s", type(connection) )
     if connection is None:
       self.log.warn("Can't connect to nothing")
       return
@@ -334,6 +407,8 @@ class TopoSwitch (DHCPD):
       if addr is (): return IPAddr(backup)
       return IPAddr(addr)
 
+    log.debug("TopoSwitch - connect: id=%s", self._id)
+
     self.ip_addr = IPAddr("10.%s.0.1" % (self._id,))
     #self.router_addr = self.ip_addr
     self.router_addr = None
@@ -365,6 +440,7 @@ class TopoSwitch (DHCPD):
 
 
   def _mac_learn (self, mac, ip):
+    self.log.debug('mac_learn:')
     if ip.inNetwork(self.network,"255.255.0.0"):
       if self.ip_to_mac.get(ip) != mac:
         self.ip_to_mac[ip] = mac
@@ -374,6 +450,7 @@ class TopoSwitch (DHCPD):
 
 
   def _on_lease (self, event):
+    self.log.debug('_on_lease:')
     if self._mac_learn(event.host_mac, event.ip):
         self.log.debug("Learn %s -> %s by DHCP Lease",event.ip,event.host_mac)
 
@@ -386,6 +463,9 @@ class TopoSwitch (DHCPD):
         self.log.warn("%s has incorrect IP %s", arpp.hwsrc, arpp.protosrc)
         return
 
+      # learn MAC by IP from ARP requests in the network.
+      # adding rule to flow table with the src IP and src MAC
+      # TODO: temporary disable
       if self._mac_learn(packet.src, arpp.protosrc):
         self.log.debug("Learn %s -> %s by ARP",arpp.protosrc,packet.src)
     else:
@@ -401,80 +481,155 @@ class TopoSwitch (DHCPD):
     return super(TopoSwitch,self)._handle_PacketIn(event)
 
 
-class topo_addressing (object):
-  def __init__ (self):
-    log.debug("topo_addressing __init__:")
-    core.listen_to_dependencies(self, listen_args={'openflow':{'priority':0}})
+class logical_pathing (object):
+    def __init__ (self):
+        log.debug("topo_addressing __init__:")
+        core.listen_to_dependencies(self, listen_args={'openflow':{'priority':0}})
+        self.optNet = None
+        # switch_id -> (ip_pair -> node_id (sw/host))
+        self.switchid_to_flowing = switchid_to_flowing
+        self.init_topo()
 
-  def _handle_ARPHelper_ARPRequest (self, event):
-    pass # Just here to make sure we load it
-
-  def _handle_openflow_discovery_LinkEvent (self, event):
-    def flip (link):
-      return Discovery.Link(link[2],link[3], link[0],link[1])
-
-    l = event.link
-    sw1 = switches_by_dpid[l.dpid1]
-    sw2 = switches_by_dpid[l.dpid2]
-
-    # Invalidate all flows and path info.
-    # For link adds, this makes sure that if a new link leads to an
-    # improved path, we use it.
-    # For link removals, this makes sure that we don't use a
-    # path that may have been broken.
-    #NOTE: This could be radically improved! (e.g., not *ALL* paths break)
-    clear = of.ofp_flow_mod(command=of.OFPFC_DELETE)
-    for sw in switches_by_dpid.itervalues():
-      if sw.connection is None: continue
-      sw.connection.send(clear)
-    path_map.clear()
-
-    if event.removed:
-      # This link no longer okay
-      if sw2 in adjacency[sw1]: del adjacency[sw1][sw2]
-      if sw1 in adjacency[sw2]: del adjacency[sw2][sw1]
-
-      # But maybe there's another way to connect these...
-      for ll in core.openflow_discovery.adjacency:
-        if ll.dpid1 == l.dpid1 and ll.dpid2 == l.dpid2:
-          if flip(ll) in core.openflow_discovery.adjacency:
-            # Yup, link goes both ways
-            adjacency[sw1][sw2] = ll.port1
-            adjacency[sw2][sw1] = ll.port2
-            # Fixed -- new link chosen to connect these
-            break
-    else:
-      # If we already consider these nodes connected, we can
-      # ignore this link up.
-      # Otherwise, we might be interested...
-      if adjacency[sw1][sw2] is None:
-        # These previously weren't connected.  If the link
-        # exists in both directions, we consider them connected now.
-        if flip(l) in core.openflow_discovery.adjacency:
-          # Yup, link goes both ways -- connected!
-          adjacency[sw1][sw2] = l.port1
-          adjacency[sw2][sw1] = l.port2
-
-    for sw in switches_by_dpid.itervalues():
-      sw.send_table()
+    def _handle_ARPHelper_ARPRequest (self, event):
+      pass # Just here to make sure we load it
 
 
-  def _handle_openflow_ConnectionUp (self, event):
-    sw = switches_by_dpid.get(event.dpid)
+    def network_is_ready(self):
+        if not (len(self.optNet.nodes()) == len(switches_by_dpid.keys())):
+            return False
+        #for node in self.optNet.nodes():
+        #    if not (node in switches_by_dpid.keys()):
+        #        return False
 
-    if sw is None:
-      # New switch
+        if not (len(self.optNet.physical_links()) == len(adjacency.keys())):
+            return False
+        #for edge in self.optNet.physical_links.keys():
+        #    if not (edge)
+        log.debug('network_is_ready!')
+        return True
 
-      sw = TopoSwitch()
-      switches_by_dpid[event.dpid] = sw
-      sw.connect(event.connection)
-    else:
-      sw.connect(event.connection)
+    def _handle_openflow_discovery_LinkEvent (self, event):
+      def flip (link):
+        return Discovery.Link(link[2],link[3], link[0],link[1])
+
+      l = event.link
+      sw1 = switches_by_dpid[l.dpid1]
+      sw2 = switches_by_dpid[l.dpid2]
+      log.debug("_handle_openflow_discovery_LinkEvent:  sw1=%s. sw2=%s ", sw1, sw2)
+
+      # Invalidate all flows and path info.
+      # For link adds, this makes sure that if a new link leads to an
+      # improved path, we use it.
+      # For link removals, this makes sure that we don't use a
+      # path that may have been broken.
+      #NOTE: This could be radically improved! (e.g., not *ALL* paths break)
+      clear = of.ofp_flow_mod(command=of.OFPFC_DELETE)
+      for sw in switches_by_dpid.itervalues():
+        if sw.connection is None: continue
+        sw.connection.send(clear)
+      path_map.clear()
+
+      #event.link  is the link object
+      if event.removed:
+        # This link no longer okay
+        if sw2 in adjacency[sw1]: del adjacency[sw1][sw2]
+        if sw1 in adjacency[sw2]: del adjacency[sw2][sw1]
+
+        # But maybe there's another way to connect these...
+        for ll in core.openflow_discovery.adjacency:
+          if ll.dpid1 == l.dpid1 and ll.dpid2 == l.dpid2:
+            if flip(ll) in core.openflow_discovery.adjacency:
+              # Yup, link goes both ways
+              adjacency[sw1][sw2] = ll.port1
+              adjacency[sw2][sw1] = ll.port2
+              # Fixed -- new link chosen to connect these
+              break
+      else:
+        # If we already consider these nodes connected, we can
+        # ignore this link up.
+        # Otherwise, we might be interested...
+        if adjacency[sw1][sw2] is None:
+          # These previously weren't connected.  If the link
+          # exists in both directions, we consider them connected now.
+          if flip(l) in core.openflow_discovery.adjacency:
+            # Yup, link goes both ways -- connected!
+            adjacency[sw1][sw2] = l.port1
+            adjacency[sw2][sw1] = l.port2
+
+      for sw in switches_by_dpid.itervalues():
+        sw.send_table()
+
+      if self.network_is_ready():
+        self.set_all_flow_tables()
+
+    '''
+        assume:
+         - host_id = switch_id that connected
+         - port_id 0 of switch connected to host
+
+    '''
+    def init_switchid_to_flowing(self):
+
+        for sw_id in self.optNet.nodes():
+            self.switchid_to_flowing[sw_id] = {}
+
+        # to support multiple paths between 2 logical nodes, we will configure
+        # only for the first path found
+        closed = []
+        for path in self.logNet.get_paths():
+            log.debug('***set flow for path: %s' % path)
+            sw_id_1  = path[0]
+            sw_id_2  = path[-1]
+            pair = (sw_id_1, sw_id_2)
+            if ((sw_id_1, sw_id_2) in closed) or ((sw_id_2, sw_id_1) in closed):
+                continue
+            closed.append(pair)
+            ip_1 = IPAddr("10.%s.1.1" % (sw_id_1,)) # host_id = switch_id
+            ip_2 = IPAddr("10.%s.1.1" % (sw_id_2,)) # host_id = switch_id
+            for ix in range(len(path)):
+                sw_id = path[ix]
+                next_hop_id = sw_id if sw_id == path[-1] else path[ix+1] #TODO: find hosts ports
+                prev_hop_id = sw_id if sw_id == path[0]  else path[ix-1]
+                self.switchid_to_flowing[sw_id][(ip_1, ip_2)] = next_hop_id
+                self.switchid_to_flowing[sw_id][(ip_2, ip_1)] = prev_hop_id
+                log.debug('sw_id=%s. next=%s. prev=%s. src_ip=%s. dst_ip=%s' % (sw_id, next_hop_id, prev_hop_id, ip_1, ip_2))
+        #log.debug('***Flowing for switch dpid=%s' % 1)
+        #log.debug(self.switchid_to_flowing[1].keys() )
+        #log.debug(switchid_to_flowing[1].keys() )
+
+    def set_all_flow_tables(self):
+        set_all_flow_tables()
+
+
+    def init_topo(self):
+        log.debug('logical_pathing - init_topo:')
+        self.optNet = OptNet.get_running_opt_net()
+        self.logNet = self.optNet.get_logical_network()
+
+        # we assume dpid = node number in the OpticalNetwork
+        self.init_switchid_to_flowing()
+
+    def _handle_openflow_ConnectionUp (self, event):
+      sw = switches_by_dpid.get(event.dpid)
+      log.debug("_handle_openflow_ConnectionUp: sw=%s. event.dpid=%s.", sw, event.dpid)
+
+      #if len(switches_by_dpid.keys()) == len(self.optNet.nodes()):
+      log.debug(switches_by_dpid.keys())
+
+      if sw is None:
+        # New switch
+
+        sw = TopoSwitch()
+        switches_by_dpid[event.dpid] = sw
+        sw.connect(event.connection)
+      else:
+        sw.connect(event.connection)
+
 
 
 
 def launch (debug = False):
-  core.registerNew(topo_addressing)
+  core.registerNew(logical_pathing)
   from proto.arp_helper import launch
   launch(eat_packets=False)
   if not debug:

@@ -303,6 +303,7 @@ class Discovery (EventMixin):
 
   def _handle_openflow_ConnectionDown (self, event):
     # Delete all links on this switch
+    log.info('_handle_openflow_ConnectionDown')
     self._delete_links([link for link in self.adjacency
                         if link.dpid1 == event.dpid
                         or link.dpid2 == event.dpid])
@@ -325,6 +326,7 @@ class Discovery (EventMixin):
     """
     Receive and process LLDP packets
     """
+    #log.info('_handle_openflow_PacketIn')
 
     packet = event.parsed
 

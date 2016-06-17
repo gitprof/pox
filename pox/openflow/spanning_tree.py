@@ -55,6 +55,7 @@ def _calc_spanning_tree ():
   def flip (link):
     return Discovery.Link(link[2],link[3], link[0],link[1])
 
+  log.debug("calc_spanning_tree")
   adj = defaultdict(lambda:defaultdict(lambda:[]))
   switches = set()
   # Add all links and switches
@@ -134,6 +135,7 @@ _hold_down = False
 def _handle_ConnectionUp (event):
   # When a switch connects, forget about previous port states
   _prev[event.dpid].clear()
+  log.debug("_handle_ConnectionUp")
 
   if _noflood_by_default:
     con = event.connection

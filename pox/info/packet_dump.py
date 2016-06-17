@@ -71,7 +71,7 @@ def _handle_PacketIn (event):
   core.getLogger("dump:" + dpidToStr(event.dpid)).debug(msg)
 
 
-def launch (verbose = False, max_length = 110, full_packets = True,
+def launch (verbose = False, max_length = 610, full_packets = True,
             hide = False, show = False):
   global _verbose, _max_length, _types, _show_by_default
   _verbose = verbose
