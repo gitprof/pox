@@ -367,6 +367,7 @@ class TopoSwitch (DHCPD):
   def _mac_learn (self, mac, ip):
     if ip.inNetwork(self.network,"255.255.0.0"):
       if self.ip_to_mac.get(ip) != mac:
+        self.log.debug("_mac_learn: setting rewrite rule")
         self.ip_to_mac[ip] = mac
         self._send_rewrite_rule(ip, mac)
         return True
@@ -374,6 +375,7 @@ class TopoSwitch (DHCPD):
 
 
   def _on_lease (self, event):
+    self.log.debug("_on_lease: DHCP Lease!")
     if self._mac_learn(event.host_mac, event.ip):
         self.log.debug("Learn %s -> %s by DHCP Lease",event.ip,event.host_mac)
 

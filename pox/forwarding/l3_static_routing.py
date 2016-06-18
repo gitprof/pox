@@ -79,23 +79,32 @@ path_map = defaultdict(lambda:defaultdict(lambda:(None,None)))
 # switchid -> (ip_pair -> next_hop)
 switchid_to_flowing = {}
 
+def print_adjacency():
+    for sw1dpid in switches_by_dpid.keys():
+        for sw2dpid in switches_by_dpid.keys():
+            sw1 = switches_by_dpid[sw1dpid]
+            sw2 = switches_by_dpid[sw2dpid]
+            log.debug('Ajacency: %s->%s : %s.' % (sw1, sw2, adjacency[sw1][sw2]))
+
 def set_all_flow_tables():
     log.debug('set_all_flow_tables: dpids=%s. ids=%s. adjaceny.keys=%s. adjacency.values=%s' % (switches_by_dpid.keys(), switchid_to_flowing.keys(), adjacency.keys(), adjacency.values())  )
     sw_dpids = switches_by_dpid.keys()
+    print_adjacency()
     for sw_dpid in sw_dpids:
         sw_id = int(sw_dpid)
         for (ip_src, ip_dst) in switchid_to_flowing[sw_id].keys():
             msg = of.ofp_flow_mod()
             msg.match = of.ofp_match()
             msg.match.dl_type = pkt.ethernet.IP_TYPE
-            msg.match.nw_dst = ip_dst
-            msg.match.nw_src = ip_src
+            msg.match.nw_dst = "%s/%s" % (ip_dst, "255.255.255.0")
+            msg.match.nw_src = "%s/%s" % (ip_src, "255.255.255.0")
             msg.priority = 65535
             hop_out_id = switchid_to_flowing[sw_id][(ip_src, ip_dst)]
             log.debug('sw=%s. hop_out_id=%s.' % (sw_id, hop_out_id))
             if hop_out_id != sw_id:
                 port_num = adjacency[switches_by_dpid[sw_dpid]][switches_by_dpid[hop_out_id]]
-                #log.debug('adjacency=%s. type=%s' % (port_num, type(port_num)))
+                log.debug('sw_id=%s. hop_out_id=%s. port_adja=%s' % (sw_id, hop_out_id, port_num))
+                # port_num = 1
                 #port_num = port_out.port_no
             else:
                 port_num = 1 #TODO: find hosts port num
@@ -266,7 +275,6 @@ class TopoSwitch (DHCPD):
 
 
 
-    '''
     # Setting rules for packet with dst IP of other networks (10.<swid>.0.0) to
     # next HOP by shortest path algo. used to route between switches.
     # we dont need it since we send traffic host-to-host
@@ -285,7 +293,6 @@ class TopoSwitch (DHCPD):
       msg.actions.append(of.ofp_action_output(port=p[0][1]))
       log.debug("bp1 - msg.match.nw_dst=%s." % msg.match.nw_dst)
       self.connection.send(msg)
-    '''
 
     """
     # Can just do this instead of MAC learning if you run arp_responder...
@@ -482,148 +489,153 @@ class TopoSwitch (DHCPD):
 
 
 class logical_pathing (object):
-    def __init__ (self):
-        log.debug("topo_addressing __init__:")
-        core.listen_to_dependencies(self, listen_args={'openflow':{'priority':0}})
-        self.optNet = None
-        # switch_id -> (ip_pair -> node_id (sw/host))
-        self.switchid_to_flowing = switchid_to_flowing
-        self.init_topo()
+  def __init__ (self):
+    log.debug("topo_addressing __init__:")
+    core.listen_to_dependencies(self, listen_args={'openflow':{'priority':0}})
+    self.optNet = None
+    # switch_id -> (ip_pair -> node_id (sw/host))
+    self.switchid_to_flowing = switchid_to_flowing
+    self.init_topo()
 
-    def _handle_ARPHelper_ARPRequest (self, event):
-      pass # Just here to make sure we load it
+  def _handle_ARPHelper_ARPRequest (self, event):
+    pass # Just here to make sure we load it
 
+  def _handle_openflow_discovery_LinkEvent (self, event):
+    def flip (link):
+      return Discovery.Link(link[2],link[3], link[0],link[1])
 
-    def network_is_ready(self):
-        if not (len(self.optNet.nodes()) == len(switches_by_dpid.keys())):
-            return False
-        #for node in self.optNet.nodes():
-        #    if not (node in switches_by_dpid.keys()):
-        #        return False
+    l = event.link
+    sw1 = switches_by_dpid[l.dpid1]
+    sw2 = switches_by_dpid[l.dpid2]
+    log.debug("_handle_openflow_discovery_LinkEvent:  sw1=%s. sw2=%s ", sw1, sw2)
 
-        if not (len(self.optNet.physical_links()) == len(adjacency.keys())):
-            return False
-        #for edge in self.optNet.physical_links.keys():
-        #    if not (edge)
-        log.debug('network_is_ready!')
-        return True
+    # Invalidate all flows and path info.
+    # For link adds, this makes sure that if a new link leads to an
+    # improved path, we use it.
+    # For link removals, this makes sure that we don't use a
+    # path that may have been broken.
+    #NOTE: This could be radically improved! (e.g., not *ALL* paths break)
+    clear = of.ofp_flow_mod(command=of.OFPFC_DELETE)
+    for sw in switches_by_dpid.itervalues():
+      if sw.connection is None: continue
+      sw.connection.send(clear)
+    path_map.clear()
 
-    def _handle_openflow_discovery_LinkEvent (self, event):
-      def flip (link):
-        return Discovery.Link(link[2],link[3], link[0],link[1])
+    #event.link  is the link object
+    if event.removed:
+      # This link no longer okay
+      if sw2 in adjacency[sw1]: del adjacency[sw1][sw2]
+      if sw1 in adjacency[sw2]: del adjacency[sw2][sw1]
 
-      l = event.link
-      sw1 = switches_by_dpid[l.dpid1]
-      sw2 = switches_by_dpid[l.dpid2]
-      log.debug("_handle_openflow_discovery_LinkEvent:  sw1=%s. sw2=%s ", sw1, sw2)
+      # But maybe there's another way to connect these...
+      for ll in core.openflow_discovery.adjacency:
+        if ll.dpid1 == l.dpid1 and ll.dpid2 == l.dpid2:
+          if flip(ll) in core.openflow_discovery.adjacency:
+            # Yup, link goes both ways
+            adjacency[sw1][sw2] = ll.port1
+            adjacency[sw2][sw1] = ll.port2
+            # Fixed -- new link chosen to connect these
+            break
+    else:
+      # If we already consider these nodes connected, we can
+      # ignore this link up.
+      # Otherwise, we might be interested...
+      if adjacency[sw1][sw2] is None:
+        # These previously weren't connected.  If the link
+        # exists in both directions, we consider them connected now.
+        if flip(l) in core.openflow_discovery.adjacency:
+          # Yup, link goes both ways -- connected!
+          adjacency[sw1][sw2] = l.port1
+          adjacency[sw2][sw1] = l.port2
 
-      # Invalidate all flows and path info.
-      # For link adds, this makes sure that if a new link leads to an
-      # improved path, we use it.
-      # For link removals, this makes sure that we don't use a
-      # path that may have been broken.
-      #NOTE: This could be radically improved! (e.g., not *ALL* paths break)
-      clear = of.ofp_flow_mod(command=of.OFPFC_DELETE)
-      for sw in switches_by_dpid.itervalues():
-        if sw.connection is None: continue
-        sw.connection.send(clear)
-      path_map.clear()
+    for sw in switches_by_dpid.itervalues():
+      sw.send_table()
 
-      #event.link  is the link object
-      if event.removed:
-        # This link no longer okay
-        if sw2 in adjacency[sw1]: del adjacency[sw1][sw2]
-        if sw1 in adjacency[sw2]: del adjacency[sw2][sw1]
-
-        # But maybe there's another way to connect these...
-        for ll in core.openflow_discovery.adjacency:
-          if ll.dpid1 == l.dpid1 and ll.dpid2 == l.dpid2:
-            if flip(ll) in core.openflow_discovery.adjacency:
-              # Yup, link goes both ways
-              adjacency[sw1][sw2] = ll.port1
-              adjacency[sw2][sw1] = ll.port2
-              # Fixed -- new link chosen to connect these
-              break
-      else:
-        # If we already consider these nodes connected, we can
-        # ignore this link up.
-        # Otherwise, we might be interested...
-        if adjacency[sw1][sw2] is None:
-          # These previously weren't connected.  If the link
-          # exists in both directions, we consider them connected now.
-          if flip(l) in core.openflow_discovery.adjacency:
-            # Yup, link goes both ways -- connected!
-            adjacency[sw1][sw2] = l.port1
-            adjacency[sw2][sw1] = l.port2
-
-      for sw in switches_by_dpid.itervalues():
-        sw.send_table()
-
-      if self.network_is_ready():
-        self.set_all_flow_tables()
+    #if self.network_is_ready():
+    #  self.set_all_flow_tables()
 
     '''
         assume:
          - host_id = switch_id that connected
          - port_id 0 of switch connected to host
-
     '''
-    def init_switchid_to_flowing(self):
+  def _handle_openflow_ConnectionUp (self, event):
+    sw = switches_by_dpid.get(event.dpid)
+    log.debug("_handle_openflow_ConnectionUp: sw=%s. event.dpid=%s.", sw, event.dpid)
 
-        for sw_id in self.optNet.nodes():
-            self.switchid_to_flowing[sw_id] = {}
+    #if len(switches_by_dpid.keys()) == len(self.optNet.nodes()):
+    log.debug(switches_by_dpid.keys())
 
-        # to support multiple paths between 2 logical nodes, we will configure
-        # only for the first path found
-        closed = []
-        for path in self.logNet.get_paths():
-            log.debug('***set flow for path: %s' % path)
-            sw_id_1  = path[0]
-            sw_id_2  = path[-1]
-            pair = (sw_id_1, sw_id_2)
-            if ((sw_id_1, sw_id_2) in closed) or ((sw_id_2, sw_id_1) in closed):
-                continue
-            closed.append(pair)
-            ip_1 = IPAddr("10.%s.1.1" % (sw_id_1,)) # host_id = switch_id
-            ip_2 = IPAddr("10.%s.1.1" % (sw_id_2,)) # host_id = switch_id
-            for ix in range(len(path)):
-                sw_id = path[ix]
-                next_hop_id = sw_id if sw_id == path[-1] else path[ix+1] #TODO: find hosts ports
-                prev_hop_id = sw_id if sw_id == path[0]  else path[ix-1]
-                self.switchid_to_flowing[sw_id][(ip_1, ip_2)] = next_hop_id
-                self.switchid_to_flowing[sw_id][(ip_2, ip_1)] = prev_hop_id
-                log.debug('sw_id=%s. next=%s. prev=%s. src_ip=%s. dst_ip=%s' % (sw_id, next_hop_id, prev_hop_id, ip_1, ip_2))
-        #log.debug('***Flowing for switch dpid=%s' % 1)
-        #log.debug(self.switchid_to_flowing[1].keys() )
-        #log.debug(switchid_to_flowing[1].keys() )
+    if sw is None:
+      # New switch
 
-    def set_all_flow_tables(self):
-        set_all_flow_tables()
+      sw = TopoSwitch()
+      switches_by_dpid[event.dpid] = sw
+      sw.connect(event.connection)
+    else:
+      sw.connect(event.connection)
+
+  def network_is_ready(self):
+    if not (len(self.optNet.nodes()) == len(switches_by_dpid.keys())):
+        return False
+    for node in self.optNet.nodes():
+        if not (node in switches_by_dpid.keys()):
+            return False
+
+    if not (len(self.optNet.physical_links()) == len(adjacency.keys())):
+        return False
+    for edge in self.optNet.physical_links().keys():
+        sw0 = switches_by_dpid[edge[0]]
+        sw1 = switches_by_dpid[edge[1]]
+        if adjacency[sw0][sw1] == None:
+            return False
+        if adjacency[sw1][sw0] == None:
+            return False
+
+    log.debug('network_is_ready!')
+    return True
+
+  def init_switchid_to_flowing(self):
+
+    for sw_id in self.optNet.nodes():
+        self.switchid_to_flowing[sw_id] = {}
+
+    # to support multiple paths between 2 logical nodes, we will configure
+    # only for the first path found
+    closed = []
+    for path in self.logNet.get_paths():
+        log.debug('***set flow for path: %s' % path)
+        sw_id_1  = path[0]
+        sw_id_2  = path[-1]
+        pair = (sw_id_1, sw_id_2)
+        if ((sw_id_1, sw_id_2) in closed) or ((sw_id_2, sw_id_1) in closed):
+            continue
+        closed.append(pair)
+        ip_1 = IPAddr("10.%s.1.0" % (sw_id_1,)) # host_id = switch_id
+        ip_2 = IPAddr("10.%s.1.0" % (sw_id_2,)) # host_id = switch_id
+        for ix in range(len(path)):
+            sw_id = path[ix]
+            next_hop_id = sw_id if sw_id == path[-1] else path[ix+1] #TODO: find hosts ports
+            prev_hop_id = sw_id if sw_id == path[0]  else path[ix-1]
+            self.switchid_to_flowing[sw_id][(ip_1, ip_2)] = next_hop_id
+            self.switchid_to_flowing[sw_id][(ip_2, ip_1)] = prev_hop_id
+            log.debug('sw_id=%s. next=%s. prev=%s. src_ip=%s. dst_ip=%s' % (sw_id, next_hop_id, prev_hop_id, ip_1, ip_2))
+    #log.debug('***Flowing for switch dpid=%s' % 1)
+    #log.debug(self.switchid_to_flowing[1].keys() )
+    #log.debug(switchid_to_flowing[1].keys() )
+
+  def set_all_flow_tables(self):
+    set_all_flow_tables()
 
 
-    def init_topo(self):
-        log.debug('logical_pathing - init_topo:')
-        self.optNet = OptNet.get_running_opt_net()
-        self.logNet = self.optNet.get_logical_network()
+  def init_topo(self):
+    self.optNet = OptNet.get_running_opt_net()
+    self.logNet = self.optNet.get_logical_network()
 
-        # we assume dpid = node number in the OpticalNetwork
-        self.init_switchid_to_flowing()
+    log.debug('logical_pathing - init_topo: physical: %s' % self.optNet.physical_links())
 
-    def _handle_openflow_ConnectionUp (self, event):
-      sw = switches_by_dpid.get(event.dpid)
-      log.debug("_handle_openflow_ConnectionUp: sw=%s. event.dpid=%s.", sw, event.dpid)
-
-      #if len(switches_by_dpid.keys()) == len(self.optNet.nodes()):
-      log.debug(switches_by_dpid.keys())
-
-      if sw is None:
-        # New switch
-
-        sw = TopoSwitch()
-        switches_by_dpid[event.dpid] = sw
-        sw.connect(event.connection)
-      else:
-        sw.connect(event.connection)
+    # we assume dpid = node number in the OpticalNetwork
+    self.init_switchid_to_flowing()
 
 
 
